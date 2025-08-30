@@ -1,32 +1,32 @@
+%%writefile /content/LoRA-Sub-DRS/methods/lorasub_drs.py
 import torch
 import torch.nn as nn
+import torch.optim as optim  # Đã thêm import optim
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
-import torch.optim as optim
 import logging
 import numpy as np
 from tqdm import tqdm
-from collections import defaultdict
-from scipy.spatial.distance import cdist
-from copy import deepcopy
-import re
-# Assuming these are defined elsewhere; replace with actual implementations if needed
 from methods.base import BaseLearner
 from utils.toolkit import tensor2numpy, accuracy
 from models.sinet_lora import SiNet
 from models.vit_lora import Attention_LoRA
+from copy import deepcopy
 from utils.schedulers import CosineSchedule
+import re
+from collections import defaultdict
 from utils.losses import AugmentedTripletLoss
-import optimgrad  # Custom optimizer, assumed to be defined
+from scipy.spatial.distance import cdist
 
 class LoRAsub_DRS(BaseLearner):
+
     def __init__(self, args):
         super().__init__(args)
 
         if args["net_type"] == "sip":
             self._network = SiNet(args)
         else:
-            raise ValueError(f'Unknown net: {args["net_type"]}.')
+            raise ValueError('Unknown net: {}.'.format(args["net_type"]))
 
         self.args = args
         self.EPSILON = args["EPSILON"]
@@ -47,7 +47,8 @@ class LoRAsub_DRS(BaseLearner):
         self.margin_inter = args["margin_inter"]
         self.eval = args['eval']
         self._protos = []
-        self.topk = 1  # origin is 5
+
+        self.topk = 1
         self.class_num = self._network.class_num
         self.debug = False
         self.fea_in = defaultdict(dict)
@@ -65,15 +66,15 @@ class LoRAsub_DRS(BaseLearner):
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         self._network.update_fc(self._total_classes)
 
-        logging.info(f'Learning on {self._known_classes}-{self._total_classes}')
+        logging.info('Learning on {}-{}'.format(self._known_classes, self._total_classes))
 
         train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train',
-                                                mode='train')
+                                                 mode='train')
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True,
-                                      num_workers=self.num_workers)
+                                       num_workers=self.num_workers)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source='test', mode='test')
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False,
-                                     num_workers=self.num_workers)
+                                      num_workers=self.num_workers)
 
         if len(self._multiple_gpus) > 1:
             self._network = nn.DataParallel(self._network, self._multiple_gpus)
@@ -86,33 +87,31 @@ class LoRAsub_DRS(BaseLearner):
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
 
-        # Freeze all parameters initially
         for name, param in self._network.named_parameters():
             param.requires_grad_(False)
             try:
-                if f"classifier_pool.{self._network.module.numtask - 1}." in name:
+                if "classifier_pool" + "." + str(self._network.module.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_A_k.{self._network.module.numtask - 1}." in name:
+                if "lora_A_k" + "." + str(self._network.module.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_A_v.{self._network.module.numtask - 1}." in name:
+                if "lora_A_v" + "." + str(self._network.module.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_B_k.{self._network.module.numtask - 1}." in name:
+                if "lora_B_k" + "." + str(self._network.module.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_B_v.{self._network.module.numtask - 1}." in name:
+                if "lora_B_v" + "." + str(self._network.module.numtask - 1) + "." in name:
                     param.requires_grad_(True)
             except:
-                if f"classifier_pool.{self._network.numtask - 1}." in name:
+                if "classifier_pool" + "." + str(self._network.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_A_k.{self._network.numtask - 1}." in name:
+                if "lora_A_k" + "." + str(self._network.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_A_v.{self._network.numtask - 1}." in name:
+                if "lora_A_v" + "." + str(self._network.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_B_k.{self._network.numtask - 1}." in name:
+                if "lora_B_k" + "." + str(self._network.numtask - 1) + "." in name:
                     param.requires_grad_(True)
-                if f"lora_B_v.{self._network.numtask - 1}." in name:
+                if "lora_B_v" + "." + str(self._network.numtask - 1) + "." in name:
                     param.requires_grad_(True)
 
-        # Verify enabled parameters
         enabled = set()
         for name, param in self._network.named_parameters():
             if param.requires_grad:
@@ -135,14 +134,103 @@ class LoRAsub_DRS(BaseLearner):
                         module.matrix_kv = 0
                         module.n_cur_matrix = 0
 
-        self.init_model_optimizer()
-        if self._cur_task == 0:
-            self.run_epoch = self.init_epoch
-        else:
-            self.update_optim_transforms()
-            self.run_epoch = self.epochs
+            self.init_model_optimizer()
+            if self._cur_task == 0:
+                self.run_epoch = self.init_epoch
+            else:
+                self.update_optim_transforms()
+                self.run_epoch = self.epochs
 
         self.train_function(train_loader, test_loader)
+
+    def compute_fisher_information(self, data_loader, model=None):
+        """Tính Fisher Information Matrix (diagonal approximation)."""
+        if model is None:
+            model = self._network
+        model.eval()
+        fisher = {name: torch.zeros_like(param).to(self._device) for name, param in model.named_parameters()}
+        for _, inputs, targets in data_loader:
+            inputs, targets = inputs.to(self._device), targets.to(self._device)
+            model.zero_grad()
+            outputs = model(inputs)['logits']
+            loss = F.cross_entropy(outputs, targets)
+            loss.backward()
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    fisher[name] += (param.grad ** 2) / len(data_loader)
+        return fisher
+
+    def compute_lambda_star(self, theta_t, theta_prev, fisher_t, fisher_prev_list):
+        """Tính hệ số λ* dựa trên BECAME."""
+        delta_theta = {name: theta_t[name] - theta_prev[name] for name in theta_t}
+        numerator = sum((delta_theta[name] * fisher_t[name]).sum() for name in fisher_t)
+        denominator = sum((delta_theta[name] * (fisher_t[name] + sum(f_prev.get(name, torch.zeros_like(fisher_t[name]).to(self._device)) for f_prev in fisher_prev_list))).sum() for name in fisher_t)
+        return numerator / (denominator + self.EPSILON)
+
+    def update_optim_transforms(self):
+        if not hasattr(self, 'fisher_prev_list'):
+            self.fisher_prev_list = []
+
+        theta_t_minus_1 = {name: param.clone() for name, param in self._network.named_parameters()}
+        
+        model_unconstrained = deepcopy(self._network).to(self._device)
+        for name, param in model_unconstrained.named_parameters():
+            param.requires_grad_(False)
+            try:
+                if "classifier_pool" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_k" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_v" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_k" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_v" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+            except:
+                if "classifier_pool" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_k" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_v" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_k" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_v" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+
+        temp_optimizer = torch.optim.Adam(
+            [p for p in model_unconstrained.parameters() if p.requires_grad],
+            lr=self.lrate,
+            weight_decay=self.weight_decay,
+            betas=(0.9, 0.999)
+        )
+        temp_scheduler = CosineSchedule(temp_optimizer, K=self.epochs)
+        
+        model_unconstrained.train()
+        for _ in range(self.epochs):
+            self.train_function(self.train_loader, None, temp_optimizer, temp_scheduler, model_unconstrained)
+        theta_hat_t = {name: param.clone() for name, param in model_unconstrained.named_parameters()}
+        
+        fisher_t = self.compute_fisher_information(self.train_loader, model_unconstrained)
+        
+        lambda_star = self.compute_lambda_star(theta_hat_t, theta_t_minus_1, fisher_t, self.fisher_prev_list)
+        print(f"Task {self._cur_task}: lambda_star = {lambda_star}")
+        
+        with torch.no_grad():
+            for module in self._network.modules():
+                if isinstance(module, Attention_LoRA):
+                    for task_id in range(self._cur_task):
+                        module.lora_A_k[task_id].weight.data *= (1 - lambda_star)
+                        module.lora_A_v[task_id].weight.data *= (1 - lambda_star)
+                        module.lora_B_k[task_id].weight.data *= (1 - lambda_star)
+                        module.lora_B_v[task_id].weight.data *= (1 - lambda_star)
+        
+        self.model_optimizer.get_eigens(self.fea_in)
+        self.model_optimizer.get_transforms()
+        self.fea_in = defaultdict(dict)
+        
+        self.fisher_prev_list.append(fisher_t)
 
     def train_function(self, train_loader, test_loader, optimizer=None, scheduler=None, model=None):
         if model is None:
@@ -151,7 +239,7 @@ class LoRAsub_DRS(BaseLearner):
             optimizer = self.model_optimizer
         if scheduler is None:
             scheduler = self.model_scheduler
-
+        
         prog_bar = tqdm(range(self.run_epoch))
         criterion = AugmentedTripletLoss(margin=self.margin_inter).to(self._device)
         for _, epoch in enumerate(prog_bar):
@@ -169,16 +257,9 @@ class LoRAsub_DRS(BaseLearner):
                 logits = ret['logits']
                 features = ret['features']
                 feature = features / features.norm(dim=-1, keepdim=True)
-
-                # Debug gradient tracking
-                print(f"Epoch {epoch+1}, Batch {i+1}: logits.grad_fn={logits.grad_fn}, features.grad_fn={features.grad_fn}")
-
                 loss = F.cross_entropy(logits, targets)
                 ATL = criterion(feature, labels, self._protos)
                 loss += self.lambada * ATL
-
-                # Debug loss
-                print(f"Loss requires_grad: {loss.requires_grad}, has grad_fn: {loss.grad_fn is not None}")
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -193,7 +274,9 @@ class LoRAsub_DRS(BaseLearner):
 
             scheduler.step()
             train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
-            info = f'Task {self._cur_task}, Epoch {epoch + 1}/{self.run_epoch} => Loss {losses / len(train_loader):.3f}, Train_accy {train_acc:.2f}'
+
+            info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}'.format(
+                self._cur_task, epoch + 1, self.run_epoch, losses / len(train_loader), train_acc)
             prog_bar.set_description(info)
 
         logging.info(info)
@@ -203,27 +286,22 @@ class LoRAsub_DRS(BaseLearner):
         with torch.no_grad():
             for class_idx in range(self._known_classes, self._total_classes):
                 data, targets, idx_dataset = self.data_manager.get_dataset(np.arange(class_idx, class_idx + 1),
-                                                                         source='train',
-                                                                         mode='test', ret_data=True)
+                                                                           source='train',
+                                                                           mode='test', ret_data=True)
                 idx_loader = DataLoader(idx_dataset, batch_size=self.args["batch_size"], shuffle=False, num_workers=4)
                 vectors, _ = self._extract_vectors(idx_loader)
                 class_mean = np.mean(vectors, axis=0)
-                # Convert to PyTorch tensor
-                self._protos.append(torch.tensor(class_mean, device=self._device, requires_grad=False))
+                self._protos.append(class_mean)
 
     def _evaluate(self, y_pred, y_true):
         ret = {}
-        print(len(y_pred), len(y_true))
         grouped = accuracy(y_pred, y_true, self._known_classes, self.class_num)
         ret['grouped'] = grouped
         ret['top1'] = grouped['total']
         return ret
 
     def eval_task(self):
-        # Normalize prototypes
-        protos = torch.stack(self._protos) if self._protos else torch.tensor([], device=self._device)
-        protos = protos / (torch.norm(protos, dim=1, keepdim=True) + self.EPSILON)
-        y_pred, y_true = self._eval_model(self.test_loader, protos.cpu().numpy())
+        y_pred, y_true = self._eval_model(self.test_loader, self._protos / np.linalg.norm(self._protos, axis=1)[:, None])
         nme_accy = self._evaluate(y_pred.T[0], y_true)
         return nme_accy
 
@@ -254,117 +332,14 @@ class LoRAsub_DRS(BaseLearner):
             lr = self.lrate
 
         fea_params = [p for n, p in self._network.named_parameters() if
-                      not bool(re.search('classifier_pool', n)) and p.requires_grad]
+                      not bool(re.search('classifier_pool', n)) and p.requires_grad == True]
         cls_params = [p for n, p in self._network.named_parameters() if bool(re.search('classifier_pool', n))]
-        model_optimizer_arg = {
-            'params': [
-                {'params': fea_params, 'svd': True, 'lr': lr, 'thres': 0.99},
-                {'params': cls_params, 'weight_decay': self.weight_decay, 'lr': self.fc_lrate}
-            ],
-            'weight_decay': self.weight_decay,
-            'betas': (0.9, 0.999)
-        }
-        self.model_optimizer = getattr(optimgrad, self.args['optim'])(**model_optimizer_arg)
+        model_optimizer_arg = {'params': [{'params': fea_params, 'svd': True, 'lr': lr,
+                                           'thres': 0.99},
+                                          {'params': cls_params, 'weight_decay': self.weight_decay,
+                                           'lr': self.fc_lrate}],
+                               'weight_decay': self.weight_decay,
+                               'betas': (0.9, 0.999)
+                               }
+        self.model_optimizer = getattr(optimgrad, self.args['optim'])(**model_optimizer.arg)
         self.model_scheduler = CosineSchedule(self.model_optimizer, K=self.epochs)
-
-    def update_optim_transforms(self):
-        if not hasattr(self, 'fisher_prev_list'):
-            self.fisher_prev_list = []
-
-        # Store current parameters
-        theta_t_minus_1 = {name: param.clone() for name, param in self._network.named_parameters()}
-
-        # Create unconstrained model
-        model_unconstrained = deepcopy(self._network).to(self._device)
-        for name, param in model_unconstrained.named_parameters():
-            param.requires_grad_(False)
-            try:
-                if f"classifier_pool.{self._network.module.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_A_k.{self._network.module.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_A_v.{self._network.module.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_B_k.{self._network.module.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_B_v.{self._network.module.numtask - 1}." in name:
-                    param.requires_grad_(True)
-            except:
-                if f"classifier_pool.{self._network.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_A_k.{self._network.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_A_v.{self._network.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_B_k.{self._network.numtask - 1}." in name:
-                    param.requires_grad_(True)
-                if f"lora_B_v.{self._network.numtask - 1}." in name:
-                    param.requires_grad_(True)
-
-        # Debug enabled parameters
-        enabled = set()
-        for name, param in model_unconstrained.named_parameters():
-            if param.requires_grad:
-                enabled.add(name)
-        print(f"model_unconstrained parameters with requires_grad=True: {enabled}")
-
-        # Create optimizer for unconstrained model
-        temp_optimizer = torch.optim.Adam(
-            [p for p in model_unconstrained.parameters() if p.requires_grad],
-            lr=self.lrate,
-            weight_decay=self.weight_decay,
-            betas=(0.9, 0.999)
-        )
-        temp_scheduler = CosineSchedule(temp_optimizer, K=self.epochs)
-
-        # Train unconstrained model
-        model_unconstrained.train()
-        for _ in range(self.epochs):
-            self.train_function(self.train_loader, None, temp_optimizer, temp_scheduler, model_unconstrained)
-        theta_hat_t = {name: param.clone() for name, param in model_unconstrained.named_parameters()}
-
-        # Compute Fisher Information Matrix
-        fisher_t = self.compute_fisher_information(self.train_loader, model_unconstrained)
-
-        # Compute lambda_star
-        lambda_star = self.compute_lambda_star(theta_hat_t, theta_t_minus_1, fisher_t, self.fisher_prev_list)
-
-        # Adjust LoRA parameters
-        with torch.no_grad():
-            for module in self._network.modules():
-                if isinstance(module, Attention_LoRA):
-                    for task_id in range(self._cur_task):
-                        module.lora_A_k[task_id].weight.data *= (1 - lambda_star)
-                        module.lora_A_v[task_id].weight.data *= (1 - lambda_star)
-                        module.lora_B_k[task_id].weight.data *= (1 - lambda_star)
-                        module.lora_B_v[task_id].weight.data *= (1 - lambda_star)
-
-        # Update optimizer transforms
-        self.model_optimizer.get_eigens(self.fea_in)
-        self.model_optimizer.get_transforms()
-        self.fea_in = defaultdict(dict)
-
-        # Store Fisher matrix
-        self.fisher_prev_list.append(fisher_t)
-
-    def compute_lambda_star(self, theta_t, theta_prev, fisher_t, fisher_prev_list):
-        delta_theta = {name: theta_t[name] - theta_prev[name] for name in theta_t}
-        numerator = sum((delta_theta[name] * fisher_t[name]).sum() for name in fisher_t)
-        denominator = sum((delta_theta[name] * (fisher_t[name] + sum(f_prev.get(name, torch.zeros_like(fisher_t[name]).to(self._device)) for f_prev in fisher_prev_list))).sum() for name in fisher_t)
-        return numerator / (denominator + self.EPSILON)
-
-    def compute_fisher_information(self, data_loader, model=None):
-        if model is None:
-            model = self._network
-        model.eval()
-        fisher = {name: torch.zeros_like(param).to(self._device) for name, param in model.named_parameters() if param.requires_grad}
-        for _, inputs, targets in data_loader:
-            inputs, targets = inputs.to(self._device), targets.to(self._device)
-            model.zero_grad()
-            outputs = model(inputs)['logits']
-            loss = F.cross_entropy(outputs, targets)
-            loss.backward()
-            for name, param in model.named_parameters():
-                if param.grad is not None:
-                    fisher[name] += (param.grad ** 2) / len(data_loader)
-        return fisher
