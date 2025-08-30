@@ -157,53 +157,53 @@ class LoRAsub_DRS(BaseLearner):
         return
 
     def train_function(self, train_loader, test_loader, optimizer=None, scheduler=None, model=None):
-      if model is None:
-          model = self._network
-      if optimizer is None:
-          optimizer = self.model_optimizer
-      if scheduler is None:
-          scheduler = self.model_scheduler
-      
-      prog_bar = tqdm(range(self.run_epoch))
-      criterion = AugmentedTripletLoss(margin=self.margin_inter).to(self._device)
-      for _, epoch in enumerate(prog_bar):
-          model.train()  # Đặt mô hình ở chế độ huấn luyện
-          losses = 0.
-          correct, total = 0, 0
-          for i, (_, inputs, targets) in enumerate(train_loader):
-              inputs, targets = inputs.to(self._device), targets.to(self._device)
-              mask = (targets >= self._known_classes).nonzero().view(-1)
-              inputs = torch.index_select(inputs, 0, mask)
-              labels = torch.index_select(targets, 0, mask)
-              targets = torch.index_select(targets, 0, mask) - self._known_classes
+        if model is None:
+            model = self._network
+        if optimizer is None:
+            optimizer = self.model_optimizer
+        if scheduler is None:
+            scheduler = self.model_scheduler
+        
+        prog_bar = tqdm(range(self.run_epoch))
+        criterion = AugmentedTripletLoss(margin=self.margin_inter).to(self._device)
+        for _, epoch in enumerate(prog_bar):
+            model.train()  # Đặt mô hình ở chế độ huấn luyện
+            losses = 0.
+            correct, total = 0, 0
+            for i, (_, inputs, targets) in enumerate(train_loader):
+                inputs, targets = inputs.to(self._device), targets.to(self._device)
+                mask = (targets >= self._known_classes).nonzero().view(-1)
+                inputs = torch.index_select(inputs, 0, mask)
+                labels = torch.index_select(targets, 0, mask)
+                targets = torch.index_select(targets, 0, mask) - self._known_classes
 
-              ret = model(inputs)
-              logits = ret['logits']
-              features = ret['features']
-              feature = features / features.norm(dim=-1, keepdim=True)
-              loss = F.cross_entropy(logits, targets)
-              ATL = criterion(feature, labels, self._protos)
-              loss += self.lambada * ATL
+                ret = model(inputs)
+                logits = ret['logits']
+                features = ret['features']
+                feature = features / features.norm(dim=-1, keepdim=True)
+                loss = F.cross_entropy(logits, targets)
+                ATL = criterion(feature, labels, self._protos)
+                loss += self.lambada * ATL
 
-              optimizer.zero_grad()
-              loss.backward()
-              optimizer.step()
-              losses += loss.item()
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                losses += loss.item()
 
-              _, preds = torch.max(logits, dim=1)
-              correct += preds.eq(targets.expand_as(preds)).cpu().sum()
-              total += len(targets)
-              if self.debug and i > 10:
-                  break
+                _, preds = torch.max(logits, dim=1)
+                correct += preds.eq(targets.expand_as(preds)).cpu().sum()
+                total += len(targets)
+                if self.debug and i > 10:
+                    break
 
-          scheduler.step()
-          train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
+            scheduler.step()
+            train_acc = np.around(tensor2numpy(correct) * 100 / total, decimals=2)
 
-          info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}'.format(
-              self._cur_task, epoch + 1, self.run_epoch, losses / len(train_loader), train_acc)
-          prog_bar.set_description(info)
+            info = 'Task {}, Epoch {}/{} => Loss {:.3f}, Train_accy {:.2f}'.format(
+                self._cur_task, epoch + 1, self.run_epoch, losses / len(train_loader), train_acc)
+            prog_bar.set_description(info)
 
-      logging.info(info)
+        logging.info(info)
 
 
 
@@ -282,77 +282,80 @@ class LoRAsub_DRS(BaseLearner):
     def update_optim_transforms(self):
       # Lưu trữ FIM của các task cũ
       if not hasattr(self, 'fisher_prev_list'):
-          self.fisher_prev_list = []
+          self.fisher_prev_listdef update_optim_transforms(self):
+        # Lưu trữ FIM của các task cũ
+        if not hasattr(self, 'fisher_prev_list'):
+            self.fisher_prev_list = []
 
-      # Lấy tham số hiện tại (θ_{t-1})
-      theta_t_minus_1 = {name: param.clone() for name, param in self._network.named_parameters()}
-      
-      # Tạo bản sao mô hình và bật requires_grad cho các tham số cần thiết
-      model_unconstrained = deepcopy(self._network).to(self._device)
-      for name, param in model_unconstrained.named_parameters():
-          param.requires_grad_(False)
-          try:
-              if "classifier_pool" + "." + str(self._network.module.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_A_k" + "." + str(self._network.module.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_A_v" + "." + str(self._network.module.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_B_k" + "." + str(self._network.module.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_B_v" + "." + str(self._network.module.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-          except:
-              if "classifier_pool" + "." + str(self._network.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_A_k" + "." + str(self._network.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_A_v" + "." + str(self._network.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_B_k" + "." + str(self._network.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
-              if "lora_B_v" + "." + str(self._network.numtask - 1) + "." in name:
-                  param.requires_grad_(True)
+        # Lấy tham số hiện tại (θ_{t-1})
+        theta_t_minus_1 = {name: param.clone() for name, param in self._network.named_parameters()}
+        
+        # Tạo bản sao mô hình và bật requires_grad cho các tham số cần thiết
+        model_unconstrained = deepcopy(self._network).to(self._device)
+        for name, param in model_unconstrained.named_parameters():
+            param.requires_grad_(False)
+            try:
+                if "classifier_pool" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_k" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_v" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_k" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_v" + "." + str(self._network.module.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+            except:
+                if "classifier_pool" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_k" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_A_v" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_k" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
+                if "lora_B_v" + "." + str(self._network.numtask - 1) + "." in name:
+                    param.requires_grad_(True)
 
-      # Tạo optimizer cho model_unconstrained
-      temp_optimizer = torch.optim.Adam(
-          [p for p in model_unconstrained.parameters() if p.requires_grad],
-          lr=self.lrate,
-          weight_decay=self.weight_decay,
-          betas=(0.9, 0.999)
-      )
-      temp_scheduler = CosineSchedule(temp_optimizer, K=self.epochs)
-      
-      # Huấn luyện không ràng buộc để lấy \hat{θ}_t
-      model_unconstrained.train()  # Đặt mô hình ở chế độ huấn luyện
-      for _ in range(self.epochs):  # Có thể giảm số epoch để tối ưu
-          self.train_function(self.train_loader, None, temp_optimizer, temp_scheduler, model_unconstrained)
-      theta_hat_t = {name: param.clone() for name, param in model_unconstrained.named_parameters()}
-      
-      # Tính FIM cho task hiện tại
-      fisher_t = self.compute_fisher_information(self.train_loader, model_unconstrained)
-      
-      # Tính λ*
-      lambda_star = self.compute_lambda_star(theta_hat_t, theta_t_minus_1, fisher_t, self.fisher_prev_list)
-      
-      # Điều chỉnh tham số LoRA của các task cũ
-      with torch.no_grad():
-          for module in self._network.modules():
-              if isinstance(module, Attention_LoRA):
-                  for task_id in range(self._cur_task):
-                      # Nhân tham số LoRA với (1 - λ*) thay vì trừ toàn bộ
-                      module.lora_A_k[task_id].weight.data *= (1 - lambda_star)
-                      module.lora_A_v[task_id].weight.data *= (1 - lambda_star)
-                      module.lora_B_k[task_id].weight.data *= (1 - lambda_star)
-                      module.lora_B_v[task_id].weight.data *= (1 - lambda_star)
-      
-      # Gọi hàm gốc để cập nhật transforms
-      self.model_optimizer.get_eigens(self.fea_in)
-      self.model_optimizer.get_transforms()
-      self.fea_in = defaultdict(dict)
-      
-      # Lưu FIM cho task hiện tại
-      self.fisher_prev_list.append(fisher_t)
+        # Tạo optimizer cho model_unconstrained
+        temp_optimizer = torch.optim.Adam(
+            [p for p in model_unconstrained.parameters() if p.requires_grad],
+            lr=self.lrate,
+            weight_decay=self.weight_decay,
+            betas=(0.9, 0.999)
+        )
+        temp_scheduler = CosineSchedule(temp_optimizer, K=self.epochs)
+        
+        # Huấn luyện không ràng buộc để lấy \hat{θ}_t
+        model_unconstrained.train()  # Đặt mô hình ở chế độ huấn luyện
+        for _ in range(self.epochs):  # Có thể giảm số epoch để tối ưu
+            self.train_function(self.train_loader, None, temp_optimizer, temp_scheduler, model_unconstrained)
+        theta_hat_t = {name: param.clone() for name, param in model_unconstrained.named_parameters()}
+        
+        # Tính FIM cho task hiện tại
+        fisher_t = self.compute_fisher_information(self.train_loader, model_unconstrained)
+        
+        # Tính λ*
+        lambda_star = self.compute_lambda_star(theta_hat_t, theta_t_minus_1, fisher_t, self.fisher_prev_list)
+        
+        # Điều chỉnh tham số LoRA của các task cũ
+        with torch.no_grad():
+            for module in self._network.modules():
+                if isinstance(module, Attention_LoRA):
+                    for task_id in range(self._cur_task):
+                        # Nhân tham số LoRA với (1 - λ*) thay vì trừ toàn bộ
+                        module.lora_A_k[task_id].weight.data *= (1 - lambda_star)
+                        module.lora_A_v[task_id].weight.data *= (1 - lambda_star)
+                        module.lora_B_k[task_id].weight.data *= (1 - lambda_star)
+                        module.lora_B_v[task_id].weight.data *= (1 - lambda_star)
+        
+        # Gọi hàm gốc để cập nhật transforms
+        self.model_optimizer.get_eigens(self.fea_in)
+        self.model_optimizer.get_transforms()
+        self.fea_in = defaultdict(dict)
+        
+        # Lưu FIM cho task hiện tại
+        self.fisher_prev_list.append(fisher_t)
 
     def compute_lambda_star(self, theta_t, theta_prev, fisher_t, fisher_prev_list):
       """Tính hệ số λ* dựa trên BECAME."""
@@ -362,19 +365,19 @@ class LoRAsub_DRS(BaseLearner):
       return numerator / (denominator + self.EPSILON)  # Tránh chia cho 0
 
     def compute_fisher_information(self, data_loader, model=None):
-      """Tính Fisher Information Matrix (diagonal approximation)."""
-      if model is None:
-          model = self._network
-      model.eval()
-      fisher = {name: torch.zeros_like(param).to(self._device) for name, param in model.named_parameters()}
-      for _, inputs, targets in data_loader:
-          inputs, targets = inputs.to(self._device), targets.to(self._device)
-          model.zero_grad()
-          outputs = model(inputs)['logits']
-          loss = F.cross_entropy(outputs, targets)
-          loss.backward()
-          for name, param in model.named_parameters():
-              if param.grad is not None:
-                  fisher[name] += (param.grad ** 2) / len(data_loader)
-      return fisher
+        """Tính Fisher Information Matrix (diagonal approximation)."""
+        if model is None:
+            model = self._network
+        model.eval()
+        fisher = {name: torch.zeros_like(param).to(self._device) for name, param in model.named_parameters()}
+        for _, inputs, targets in data_loader:
+            inputs, targets = inputs.to(self._device), targets.to(self._device)
+            model.zero_grad()
+            outputs = model(inputs)['logits']
+            loss = F.cross_entropy(outputs, targets)
+            loss.backward()
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    fisher[name] += (param.grad ** 2) / len(data_loader)
+        return fisher
 
