@@ -280,9 +280,6 @@ class LoRAsub_DRS(BaseLearner):
         self.model_scheduler = CosineSchedule(self.model_optimizer, K=self.epochs)
 
     def update_optim_transforms(self):
-      # Lưu trữ FIM của các task cũ
-      if not hasattr(self, 'fisher_prev_list'):
-          self.fisher_prev_listdef update_optim_transforms(self):
         # Lưu trữ FIM của các task cũ
         if not hasattr(self, 'fisher_prev_list'):
             self.fisher_prev_list = []
