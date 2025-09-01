@@ -18,23 +18,19 @@ from utils.losses import AugmentedTripletLoss
 from scipy.spatial.distance import cdist
 
 # Hàm từ train_util.py của BECAME
-def compute_fisher_matrix_diag(args, model, device, optimizer, xtrain, ytrain, task_id, **kwargs):
+def compute_fisher_matrix_diag(args, model, device, optimizer, train_loader, task_id):
     model.eval()
     fisher = defaultdict(float)
     criterion = torch.nn.CrossEntropyLoss()
-    for i in range(0, len(xtrain), args.batch_size_train):
-        if i + args.batch_size_train <= len(xtrain):
-            b = torch.arange(i, i + args.batch_size_train)
-        else:
-            b = torch.arange(i, len(xtrain))
-        data, target = xtrain[b].to(device), ytrain[b].to(device)
+    for i, (_, data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
         optimizer.zero_grad()
         output = model(data)['logits']
         loss = criterion(output, target)
         loss.backward()
         for n, p in model.named_parameters():
             if p.grad is not None and "lora" in n:
-                fisher[n] += (p.grad.data ** 2).sum().item() / len(xtrain)
+                fisher[n] += (p.grad.data ** 2).sum().item() / len(train_loader.dataset)
     return fisher
 
 def compute_fisher_merging(model, old_model, cur_fisher, old_fisher):
@@ -94,17 +90,22 @@ class LoRAsub_DRS(BaseLearner):
     def after_task(self):
         self._known_classes = self._total_classes
         # Tính và lưu FIM sau mỗi tác vụ
-        self._compute_fisher()
+        if hasattr(self, 'train_loader') and len(self.train_loader.dataset) > 0:
+            self._compute_fisher()
+        else:
+            logging.warning(f"Skipping Fisher computation for task {self._cur_task}: Empty or unavailable dataset")
         # Lưu trạng thái mô hình cũ
         self.old_model = deepcopy(self._network.state_dict())
 
     def _compute_fisher(self):
         """Tính Fisher Information Matrix cho các tham số LoRA của tác vụ hiện tại."""
+        if not hasattr(self, 'train_loader') or len(self.train_loader.dataset) == 0:
+            logging.error(f"Cannot compute Fisher for task {self._cur_task}: train_loader is empty or not initialized")
+            return
+
         fisher = compute_fisher_matrix_diag(
             self.args, self._network, self._device, self.model_optimizer,
-            self.data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train', mode='train').dataset.data,
-            self.data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train', mode='train').dataset.targets,
-            self._cur_task
+            self.train_loader, self._cur_task
         )
         if self._cur_task > 0:
             # Cập nhật FIM với fisher_gamma
@@ -120,10 +121,15 @@ class LoRAsub_DRS(BaseLearner):
             return
 
         # Lấy FIM của tác vụ hiện tại và các tác vụ cũ
-        cur_fisher = self.fisher_dict[self._cur_task]
+        cur_fisher = self.fisher_dict.get(self._cur_task, {})
+        if not cur_fisher:
+            logging.warning(f"No Fisher information for task {self._cur_task}. Using default λ* = 0.5")
+            self.lambda_star = 0.5
+            return
+
         old_fisher = defaultdict(float)
         for task_id in range(self._cur_task):
-            for n, f in self.fisher_dict[task_id].items():
+            for n, f in self.fisher_dict.get(task_id, {}).items():
                 old_fisher[n] += f / self._cur_task
 
         # Tính λ* bằng compute_fisher_merging từ BECAME
@@ -134,10 +140,16 @@ class LoRAsub_DRS(BaseLearner):
         self.data_manager = data_manager
         self._cur_task += 1
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
+        if self._total_classes <= self._known_classes:
+            logging.error(f"Invalid task size for task {self._cur_task}: _total_classes ({self._total_classes}) <= _known_classes ({self._known_classes})")
+            raise ValueError("Task size must be greater than zero")
         self._network.update_fc(self._total_classes)
         logging.info('Learning on {}-{}'.format(self._known_classes, self._total_classes))
 
         train_dataset = data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train', mode='train')
+        if len(train_dataset) == 0:
+            logging.error(f"Empty training dataset for task {self._cur_task}")
+            raise ValueError("Training dataset cannot be empty")
         self.train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
         test_dataset = data_manager.get_dataset(np.arange(0, self._total_classes), source='test', mode='test')
         self.test_loader = DataLoader(test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
