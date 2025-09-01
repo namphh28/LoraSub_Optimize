@@ -17,6 +17,40 @@ from collections import defaultdict
 from utils.losses import AugmentedTripletLoss
 from scipy.spatial.distance import cdist
 
+# Hàm từ train_util.py của BECAME
+def compute_fisher_matrix_diag(args, model, device, optimizer, xtrain, ytrain, task_id, **kwargs):
+    model.eval()
+    fisher = defaultdict(float)
+    criterion = torch.nn.CrossEntropyLoss()
+    for i in range(0, len(xtrain), args.batch_size_train):
+        if i + args.batch_size_train <= len(xtrain):
+            b = torch.arange(i, i + args.batch_size_train)
+        else:
+            b = torch.arange(i, len(xtrain))
+        data, target = xtrain[b].to(device), ytrain[b].to(device)
+        optimizer.zero_grad()
+        output = model(data)['logits']
+        loss = criterion(output, target)
+        loss.backward()
+        for n, p in model.named_parameters():
+            if p.grad is not None and "lora" in n:
+                fisher[n] += (p.grad.data ** 2).sum().item() / len(xtrain)
+    return fisher
+
+def compute_fisher_merging(model, old_model, cur_fisher, old_fisher):
+    theta = 0.0
+    total_fisher = 0.0
+    for n, p in model.named_parameters():
+        f_old = old_fisher.get(n, 0.0)
+        f_cur = cur_fisher.get(n, 0.0)
+        total_fisher += f_old + f_cur
+        if f_old + f_cur > 0:
+            theta += f_old / (f_old + f_cur)
+    return theta / len(cur_fisher) if total_fisher > 0 else 0.5
+
+def get_avg_fisher(fisher):
+    return sum(fisher.values()) / len(fisher) if fisher else 0.0
+
 class LoRAsub_DRS(BaseLearner):
     def __init__(self, args):
         super().__init__(args)
@@ -43,12 +77,14 @@ class LoRAsub_DRS(BaseLearner):
         self.fc_lrate = args["fc_lrate"]
         self.margin_inter = args["margin_inter"]
         self.eval = args['eval']
+        self.fisher_gamma = args.get('fisher_gamma', 0.1)  # Thêm fisher_gamma từ BECAME
         self._protos = []
         self.topk = 1
         self.class_num = self._network.class_num
         self.debug = False
         self.fea_in = defaultdict(dict)
         self.fisher_dict = {}  # Lưu trữ Fisher Information Matrix cho mỗi tác vụ
+        self.old_model = None  # Lưu trạng thái mô hình cũ
         self.lambda_star = None  # Hệ số hợp nhất λ*
 
         for module in self._network.modules():
@@ -59,21 +95,23 @@ class LoRAsub_DRS(BaseLearner):
         self._known_classes = self._total_classes
         # Tính và lưu FIM sau mỗi tác vụ
         self._compute_fisher()
+        # Lưu trạng thái mô hình cũ
+        self.old_model = deepcopy(self._network.state_dict())
 
     def _compute_fisher(self):
         """Tính Fisher Information Matrix cho các tham số LoRA của tác vụ hiện tại."""
-        self._network.eval()
-        fisher = defaultdict(float)
-        for i, (_, inputs, targets) in enumerate(self.train_loader):
-            inputs, targets = inputs.to(self._device), targets.to(self._device)
-            outputs = self._network(inputs)['logits']
-            log_probs = F.log_softmax(outputs, dim=1)
-            for n, p in self._network.named_parameters():
-                if p.requires_grad and "lora" in n:  # Chỉ tính FIM cho tham số LoRA
-                    grad = torch.autograd.grad(log_probs.mean(), p, create_graph=True)[0]
-                    fisher[n] += (grad ** 2).sum().item() / len(self.train_loader)
+        fisher = compute_fisher_matrix_diag(
+            self.args, self._network, self._device, self.model_optimizer,
+            self.data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train', mode='train').dataset.data,
+            self.data_manager.get_dataset(np.arange(self._known_classes, self._total_classes), source='train', mode='train').dataset.targets,
+            self._cur_task
+        )
+        if self._cur_task > 0:
+            # Cập nhật FIM với fisher_gamma
+            for n in fisher:
+                fisher[n] += self.fisher_dict.get(self._cur_task - 1, {}).get(n, 0.0) * self.fisher_gamma
         self.fisher_dict[self._cur_task] = fisher
-        self._network.train()
+        logging.info(f"Average Fisher for task {self._cur_task}: {get_avg_fisher(fisher)}")
 
     def _compute_lambda_star(self):
         """Tính λ* dựa trên FIM của tác vụ hiện tại và các tác vụ cũ."""
@@ -82,21 +120,14 @@ class LoRAsub_DRS(BaseLearner):
             return
 
         # Lấy FIM của tác vụ hiện tại và các tác vụ cũ
-        fisher_current = self.fisher_dict[self._cur_task]
-        fisher_old = defaultdict(float)
+        cur_fisher = self.fisher_dict[self._cur_task]
+        old_fisher = defaultdict(float)
         for task_id in range(self._cur_task):
             for n, f in self.fisher_dict[task_id].items():
-                fisher_old[n] += f / self._cur_task
+                old_fisher[n] += f / self._cur_task
 
-        # Tính λ* theo công thức trong BECAME (giả định đơn giản hóa)
-        lambda_star = 0.0
-        total_fisher = 0.0
-        for n, f_current in fisher_current.items():
-            f_old = fisher_old.get(n, 0.0)
-            total_fisher += f_old + f_current
-            if f_old + f_current > 0:
-                lambda_star += f_old / (f_old + f_current)
-        self.lambda_star = lambda_star / len(fisher_current) if total_fisher > 0 else 0.5
+        # Tính λ* bằng compute_fisher_merging từ BECAME
+        self.lambda_star = compute_fisher_merging(self._network, self.old_model, cur_fisher, old_fisher)
         logging.info(f'Computed λ* for task {self._cur_task}: {self.lambda_star}')
 
     def incremental_train(self, data_manager):
