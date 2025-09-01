@@ -17,16 +17,22 @@ from collections import defaultdict
 from utils.losses import AugmentedTripletLoss
 from scipy.spatial.distance import cdist
 
-# Hàm từ train_util.py của BECAME
-def compute_fisher_matrix_diag(args, model, device, optimizer, train_loader, task_id):
+# Hàm từ train_util.py của BECAME, đã điều chỉnh để xử lý nhãn
+def compute_fisher_matrix_diag(args, model, device, optimizer, train_loader, task_id, known_classes=0):
     model.eval()
     fisher = defaultdict(float)
     criterion = torch.nn.CrossEntropyLoss()
     for i, (_, data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
+        # Điều chỉnh nhãn để phù hợp với đầu ra của mô hình
+        adjusted_target = target - known_classes
+        # Kiểm tra nhãn có hợp lệ không
+        if (adjusted_target < 0).any() or (adjusted_target >= (model.class_num - known_classes)).any():
+            logging.error(f"Invalid target labels in task {task_id}: {adjusted_target}")
+            raise ValueError("Target labels out of bounds for CrossEntropyLoss")
         optimizer.zero_grad()
         output = model(data)['logits']
-        loss = criterion(output, target)
+        loss = criterion(output, adjusted_target)
         loss.backward()
         for n, p in model.named_parameters():
             if p.grad is not None and "lora" in n:
@@ -105,7 +111,7 @@ class LoRAsub_DRS(BaseLearner):
 
         fisher = compute_fisher_matrix_diag(
             self.args, self._network, self._device, self.model_optimizer,
-            self.train_loader, self._cur_task
+            self.train_loader, self._cur_task, known_classes=self._known_classes
         )
         if self._cur_task > 0:
             # Cập nhật FIM với fisher_gamma
