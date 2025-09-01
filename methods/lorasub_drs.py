@@ -372,9 +372,8 @@ class LoRAsub_DRS(BaseLearner):
                     fisher[name] += (param.grad ** 2) / len(data_loader)
         return fisher
 
-    def compute_lambda_star(self, theta_t, theta_prev, fisher_t, fisher_prev_list):
-        """Tính hệ số λ* dựa trên BECAME."""
-        delta_theta = {name: theta_t[name] - theta_prev[name] for name in theta_t}
-        numerator = sum((delta_theta[name] * fisher_t[name]).sum() for name in fisher_t)
-        denominator = sum((delta_theta[name] * (fisher_t[name] + sum(f_prev.get(name, torch.zeros_like(fisher_t[name])) for f_prev in fisher_prev_list))).sum() for name in fisher_t)
-        return numerator / (denominator + self.EPSILON)  # Tránh chia cho 0
+    def compute_lambda_star(self, fisher_current, fisher_old_sum):
+        numerator = sum(f for f in fisher_current.values())
+        denominator = sum(f + fisher_old_sum.get(n, 0.0) for n, f in fisher_current.items())
+        lambda_star = numerator / (denominator + 1e-6)
+        return min(max(lambda_star, 0.0), 1.0)
