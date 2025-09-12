@@ -17,19 +17,23 @@ from collections import defaultdict
 from utils.losses import AugmentedTripletLoss
 from scipy.spatial.distance import cdist
 
-# Hàm từ train_util.py của BECAME, đã điều chỉnh để xử lý nhãn
 def compute_fisher_matrix_diag(args, model, device, optimizer, train_loader, task_id, known_classes=0):
     model.eval()
     fisher = defaultdict(float)
     criterion = torch.nn.CrossEntropyLoss()
     for i, (_, data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
-        # Điều chỉnh nhãn để phù hợp với đầu ra của mô hình
         adjusted_target = target - known_classes
-        # Kiểm tra nhãn có hợp lệ không
-        if (adjusted_target < 0).any() or (adjusted_target >= (model.class_num - known_classes)).any():
-            logging.error(f"Invalid target labels in task {task_id}: {adjusted_target}")
-            raise ValueError("Target labels out of bounds for CrossEntropyLoss")
+        num_classes = model.class_num - known_classes
+        if num_classes <= 0:
+            logging.error(f"Invalid num_classes ({num_classes}) for task {task_id}. Skipping batch.")
+            continue
+        logging.debug(f"Task {task_id} - Original targets: {target[:10]}")
+        logging.debug(f"Task {task_id} - Adjusted targets before clamp: {adjusted_target[:10]}")
+        if (adjusted_target < 0).any() or (adjusted_target >= num_classes).any():
+            logging.warning(f"Invalid target labels detected in task {task_id}: {adjusted_target}")
+            adjusted_target = torch.clamp(adjusted_target, min=0, max=num_classes - 1)
+            logging.info(f"Clamped target labels to [0, {num_classes - 1}]")
         optimizer.zero_grad()
         output = model(data)['logits']
         loss = criterion(output, adjusted_target)
@@ -79,32 +83,29 @@ class LoRAsub_DRS(BaseLearner):
         self.fc_lrate = args["fc_lrate"]
         self.margin_inter = args["margin_inter"]
         self.eval = args['eval']
-        self.fisher_gamma = args.get('fisher_gamma', 0.1)  # Thêm fisher_gamma từ BECAME
+        self.fisher_gamma = args.get('fisher_gamma', 0.1)
         self._protos = []
         self.topk = 1
         self.class_num = self._network.class_num
-        self.debug = False
         self.fea_in = defaultdict(dict)
-        self.fisher_dict = {}  # Lưu trữ Fisher Information Matrix cho mỗi tác vụ
-        self.old_model = None  # Lưu trạng thái mô hình cũ
-        self.lambda_star = None  # Hệ số hợp nhất λ*
+        self.fisher_dict = {}
+        self.old_model = None
+        self.lambda_star = None
 
         for module in self._network.modules():
             if isinstance(module, Attention_LoRA):
                 module.init_param()
 
     def after_task(self):
-        self._known_classes = self._total_classes
-        # Tính và lưu FIM sau mỗi tác vụ
+        logging.info(f"Running after_task for task {self._cur_task}")
         if hasattr(self, 'train_loader') and len(self.train_loader.dataset) > 0:
             self._compute_fisher()
         else:
             logging.warning(f"Skipping Fisher computation for task {self._cur_task}: Empty or unavailable dataset")
-        # Lưu trạng thái mô hình cũ
+        self._known_classes = self._total_classes
         self.old_model = deepcopy(self._network.state_dict())
 
     def _compute_fisher(self):
-        """Tính Fisher Information Matrix cho các tham số LoRA của tác vụ hiện tại."""
         if not hasattr(self, 'train_loader') or len(self.train_loader.dataset) == 0:
             logging.error(f"Cannot compute Fisher for task {self._cur_task}: train_loader is empty or not initialized")
             return
@@ -114,19 +115,16 @@ class LoRAsub_DRS(BaseLearner):
             self.train_loader, self._cur_task, known_classes=self._known_classes
         )
         if self._cur_task > 0:
-            # Cập nhật FIM với fisher_gamma
             for n in fisher:
                 fisher[n] += self.fisher_dict.get(self._cur_task - 1, {}).get(n, 0.0) * self.fisher_gamma
         self.fisher_dict[self._cur_task] = fisher
         logging.info(f"Average Fisher for task {self._cur_task}: {get_avg_fisher(fisher)}")
 
     def _compute_lambda_star(self):
-        """Tính λ* dựa trên FIM của tác vụ hiện tại và các tác vụ cũ."""
         if self._cur_task == 0:
-            self.lambda_star = 1.0  # Không cần hợp nhất cho tác vụ đầu tiên
+            self.lambda_star = 1.0
             return
 
-        # Lấy FIM của tác vụ hiện tại và các tác vụ cũ
         cur_fisher = self.fisher_dict.get(self._cur_task, {})
         if not cur_fisher:
             logging.warning(f"No Fisher information for task {self._cur_task}. Using default λ* = 0.5")
@@ -138,7 +136,6 @@ class LoRAsub_DRS(BaseLearner):
             for n, f in self.fisher_dict.get(task_id, {}).items():
                 old_fisher[n] += f / self._cur_task
 
-        # Tính λ* bằng compute_fisher_merging từ BECAME
         self.lambda_star = compute_fisher_merging(self._network, self.old_model, cur_fisher, old_fisher)
         logging.info(f'Computed λ* for task {self._cur_task}: {self.lambda_star}')
 
@@ -167,6 +164,7 @@ class LoRAsub_DRS(BaseLearner):
         if len(self._multiple_gpus) > 1:
             self._network = self._network.module
         self._build_protos()
+        self.after_task()
 
     def _train(self, train_loader, test_loader):
         self._network.to(self._device)
@@ -222,18 +220,16 @@ class LoRAsub_DRS(BaseLearner):
             if self._cur_task == 0:
                 self.run_epoch = self.init_epoch
             else:
-                self._compute_lambda_star()  # Tính λ* trước khi cập nhật optimizer
+                self._compute_lambda_star()
                 self.update_optim_transforms()
                 self.run_epoch = self.epochs
 
         self.train_function(train_loader, test_loader)
 
     def update_optim_transforms(self):
-        """Cập nhật không gian DRS với phép trừ có trọng số λ*."""
         if self._cur_task == 0:
             return
 
-        # Áp dụng phép trừ có trọng số λ* cho các trọng số LoRA cũ
         for module in self._network.modules():
             if isinstance(module, Attention_LoRA):
                 for task_id in range(self._cur_task):
@@ -241,7 +237,7 @@ class LoRAsub_DRS(BaseLearner):
                         param = getattr(module, param_name)[self._cur_task].weight
                         old_param = self.fea_in.get(getattr(module, param_name)[task_id].weight, None)
                         if old_param is not None:
-                            param.data -= self.lambda_star * old_param  # Trừ có trọng số λ*
+                            param.data -= self.lambda_star * old_param
 
         self.model_optimizer.get_eigens(self.fea_in)
         self.model_optimizer.get_transforms()
@@ -257,7 +253,6 @@ class LoRAsub_DRS(BaseLearner):
                       not bool(re.search('classifier_pool', n)) and p.requires_grad == True]
         cls_params = [p for n, p in self._network.named_parameters() if bool(re.search('classifier_pool', n))]
         
-        # Định nghĩa từ điển tham số cho optimizer
         optimizer_args = {
             'params': [
                 {'params': fea_params, 'svd': True, 'lr': lr, 'thres': 0.99},
@@ -267,7 +262,6 @@ class LoRAsub_DRS(BaseLearner):
             'betas': (0.9, 0.999)
         }
         
-        # Tạo optimizer với từ điển tham số
         self.model_optimizer = getattr(optimgrad, self.args['optim'])(**optimizer_args)
         self.model_scheduler = CosineSchedule(self.model_optimizer, K=self.epochs)
 
@@ -318,7 +312,7 @@ class LoRAsub_DRS(BaseLearner):
                 data, targets, idx_dataset = self.data_manager.get_dataset(np.arange(class_idx, class_idx + 1),
                                                                            source='train',
                                                                            mode='test', ret_data=True)
-                idx_loader = DataLoader(idx_dataset, batch_size=self.args["batch_size"], shuffle=False, num_workers=4)
+                idx_loader = DataLoader(idx_dataset, batch_size=self.args["batch_size"], shuffle=False, num_workers=2)
                 vectors, _ = self._extract_vectors(idx_loader)
                 class_mean = np.mean(vectors, axis=0)
                 self._protos.append(class_mean)
